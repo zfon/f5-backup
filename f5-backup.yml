@@ -1,0 +1,16 @@
+backups:
+    path: './'
+    use_hostname: true
+logging:
+    filename: 'f5-backup.log'
+    path: './'
+    level: logging.INFO
+    logFileformat: '%(asctime)s-%(process)d-%(levelname)s %(message)s'
+    logStdOutformat: '%(asctime)s-%(process)d-%(levelname)s %(message)s'
+    print: true
+credentials:
+    username: 'f5backups'
+    password: 'f5backUPS'
+devices:
+    - f501.f5.com
+    - 10.10.25.12

@@ -1,5 +1,6 @@
 #! /usr/bin/env python
 # -*- coding: utf-8 -*-
+# https://github.com/sebastien6/f5-backup
 
 import os
 import json
@@ -10,18 +11,34 @@ import optparse
 import sys
 import hashlib
 from urllib3.exceptions import InsecureRequestWarning
+import yaml
+import os.path
+import pprint
+import logging
 
 # Root CA for SSL verification
 ROOTCA = ''
 CHECKSUM = ''
 HOSTNAME = ''
-STATUS = False
 
+CONFIG_FILE = 'f5-backup.yml'
+
+def load_config(config_file):
+    with open(config_file, 'r') as stream:
+        try:
+            return yaml.safe_load(stream)
+        except yaml.YAMLError as exc:
+            logging.error(exc)
+
+def pp(*stuff):
+    pp = pprint.PrettyPrinter(indent=4)
+    return pp.pprint(stuff)
+    
 # credential Ask for user Active Directory authentication information
 # with a verification of entered password
 def credential():
     #User name capture
-    user = input('Enter Active Directory Username: ')
+    user = raw_input('Enter Active Directory Username: ')
     # start infinite loop
     while True:
         # Capture password without echoing 
@@ -34,13 +51,10 @@ def credential():
 
 # get_token() will call F5 Big-ip API with username and password to obtain an authentication
 # security token
-def get_token(session):
+def get_token(session, username, password):
     # Build URL
     URL_AUTH = 'https://%s/mgmt/shared/authn/login' % HOSTNAME
     
-    # Request user credential
-    username, password = credential()
-
     # prepare payload for request
     payload = {}
     payload['username'] = username
@@ -53,18 +67,18 @@ def get_token(session):
     # send request and handle connectivity error with try/except
     try:
         resp = session.post(URL_AUTH, json.dumps(payload)).json()
-    except:
-        print("Error sending request to F5 big-ip. Check your hostname or network connection")
-        exit(1)
+    except Exception as e:
+        logging.error("Error sending request to F5 big-ip. Check your hostname or network connection")
+        raise e
     
     # filter key in response. if 'code' key present, answer was not a 200 and error message with code is printed.
     for k in resp.keys():
         if k == 'code':
-            print('security authentication token creation failure. Error: %s, Message: %s' % (resp['code'],resp['message']))
-            exit(1)
+            logging.error('security authentication token creation failure. Error: %s, Message: %s' % (resp['code'],resp['message']))
+            raise
     
     # Print a successful message log and return the generated token
-    print('Security authentication token for user %s was successfully created' % resp['token']['userName'])
+    logging.info('Security authentication token for user %s was successfully created' % resp['token']['userName'])
     return resp['token']['token']
 
 # create_ucs will call F5 Big-ip API with security token authentication to create a timestamps ucs backup
@@ -83,18 +97,18 @@ def create_ucs(session):
     # send request and handle connectivity error with try/except
     try:
         resp = session.post(URL_UCS, json.dumps(payload)).json()
-    except:
-        print("Error sending request to F5 big-ip. Check your hostname or network connection")
-        exit(1)
+    except Exception as e:
+        logging.error("Error sending request to F5 big-ip. Check your hostname or network connection")
+        raise e
     
     # filter key in response. if 'code' key present, answer was not a 200 and error message with code is printed.
     for k in resp.keys():
         if k == 'code':
-            print('UCS backup creation failure. Error: %s, Message: %s' % (resp['code'],resp['message']))
-            exit(1)
+            logging.error('UCS backup creation failure. Error: %s, Message: %s' % (resp['code'],resp['message']))
+            raise
 
     # Print a successful message log
-    print("UCS backup of file %s on host %s successfully completed" % (resp['name'], HOSTNAME))
+    logging.info("UCS backup of file %s on host %s successfully completed" % (resp['name'], HOSTNAME))
 
     return ucs_filename, checksum(session, ucs_filename)
 
@@ -108,12 +122,12 @@ def checksum(session, filename):
     # send request and handle connectivity error with try/except
     try:
         resp = session.post(URL_BASH, json.dumps(payload)).json()['commandResult']
-    except:
-        print("Error sending request to F5 big-ip. Check your hostname or network connection")
-        exit(1)
+    except Exception as e:
+        logging.error("Error sending request to F5 big-ip. Check your hostname or network connection")
+        raise e
 
     checksum = resp.split()
-    
+    logging.info('Remote checksum: ' + str(checksum[0]))
     return checksum[0]
 
 # delete_ucs will call F5 Big-ip API with security token authentication to delete the ucs backup
@@ -127,11 +141,11 @@ def delete_ucs(session, ucs_filename):
     # send request and handle connectivity error with try/except
     try:
         session.post(URL_BASH, json.dumps(payload)).json()
-    except:
-        print("Error sending request to F5 big-ip. Check your hostname or network connection")
-        exit(1)
+    except Exception as e:
+        logging.error("Error sending request to F5 big-ip. Check your hostname or network connection")
+        raise e
 
-def ucsDownload(ucs_filename, token):
+def ucsDownload(ucs_filename, token, path):
     global STATUS
 
     # Build request URL
@@ -151,7 +165,7 @@ def ucsDownload(ucs_filename, token):
     uri = '%s%s' % (URL_DOWNLOAD, filename)
     
     requests.packages
-    with open(ucs_filename, 'wb') as f:
+    with open(path + ucs_filename, 'wb') as f:
         start = 0
         end = chunk_size - 1
         size = 0
@@ -202,8 +216,8 @@ def ucsDownload(ucs_filename, token):
                 end = size
             else:
                 end = start + chunk_size - 1
-
-    if sha256_checksum(ucs_filename) == CHECKSUM:
+    f.close()
+    if sha256_checksum(path + ucs_filename) == CHECKSUM:
         STATUS = True
 
 def sha256_checksum(filename, block_size=65536):
@@ -211,14 +225,16 @@ def sha256_checksum(filename, block_size=65536):
     with open(filename, 'rb') as f:
         for block in iter(lambda: f.read(block_size), b''):
             sha256.update(block)
+    f.close()
+    logging.info('Local checksum:  ' + str(sha256.hexdigest()))
     return sha256.hexdigest()
 
-def f5Backup(hostname):
-    global STATUS, CHECKSUM,HOSTNAME
+def f5Backup(hostname, username, password, path):
+    global STATUS,CHECKSUM,HOSTNAME
     counter = 0
-    
     HOSTNAME = hostname
-
+    STATUS = False
+    
     # Disable SSL warning for Insecure request
     requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
     
@@ -238,8 +254,8 @@ def f5Backup(hostname):
     session.timeout = '30'
 
     # get a new authentication security token from F5
-    print('Start remote backup F5 big-Ip device %s ' % HOSTNAME)
-    token = get_token(session)
+    logging.info('>>>> Start remote backup F5 big-Ip device %s ' % HOSTNAME)
+    token = get_token(session, username, password)
     
     # disable username, password authentication and replace by security token 
     # authentication in the session header
@@ -247,28 +263,29 @@ def f5Backup(hostname):
     session.headers.update({'X-F5-Auth-Token': token})
     
     # create a new F5 big-ip backup file on the F5 device
-    print('Creation UCS backup file on F5 device %s' % HOSTNAME)
+    logging.info('Creation UCS backup file on F5 device %s' % HOSTNAME)
     ucs_filename, CHECKSUM = create_ucs(session)
     
     # locally download the created ucs backup file
     #download_ucs(session, ucs_filename)
     while not STATUS:
-        print("Download file %s attempt %s" % (ucs_filename, counter+1))
-        ucsDownload(ucs_filename, token)
+        logging.info("Download file %s attempt %s" % (ucs_filename, counter+1))
+        ucsDownload(ucs_filename, token, path)
         counter+=1
         if counter >2:
-            print('UCS backup download failure. inconscistent' \
+            logging.error('UCS backup download failure. inconscistent' \
             'checksum between origin and destination')
-            print('program will exit and ucs file will not be deleted from F5 device')
-            exit(1)
+            logging.error('program will exit and ucs file will not be deleted from F5 device')
+            raise
     
-    print('UCS backup checksum verification successful')
+    logging.info('UCS backup checksum verification successful')
 
     # delete the ucs file from f5 after local download
     # to keep f5 disk space clean
     delete_ucs(session, ucs_filename)
 
 if __name__ == "__main__":
+	
     # Define a new argument parser
     parser=optparse.OptionParser()
 
@@ -277,10 +294,61 @@ if __name__ == "__main__":
 
     # Parse arguments
     (opts,args) = parser.parse_args()
-
+    
     # Check if --hostname argument populated or not
     if not opts.hostname:
-        print('--hostname argument is required.')
-        exit(1)
-
-    f5Backup(opts.hostname)
+        if os.path.exists(CONFIG_FILE):
+            config = load_config(CONFIG_FILE)
+            
+            #logging init
+            logger = logging.getLogger('')
+            logger.setLevel(eval(config['logging']['level']))
+            
+            if not os.path.exists(config['backups']['path']):
+                logging.error('>> Backup path "%s" does not exist.' % config['backups']['path'])
+                exit(1)
+            if not os.path.exists(config['logging']['path']):
+                logging.error('>> Logging path "%s" does not exist.' % config['backups']['path'])
+                exit(1)      
+                      
+            if config['logging']['print']:
+                ch_stdout_logformat = logging.Formatter(config['logging']['logStdOutformat'])
+                ch_stdout = logging.StreamHandler(sys.stdout)
+                ch_stdout.setFormatter(ch_stdout_logformat)
+                logger.addHandler(ch_stdout)
+            
+            ch_file_logformat = logging.Formatter(config['logging']['logFileformat'])
+            ch_file = logging.FileHandler("{0}/{1}".format(config['logging']['path'], config['logging']['filename']))
+            ch_file.setFormatter(ch_file_logformat)
+            logger.addHandler(ch_file)
+            
+            # Backup begins
+            logging.info('#### Starting backup operation for %s ####' % config['devices'])
+            for device in config['devices']:
+                path = config['backups']['path']
+                if config['backups']['use_hostname']:
+                    path += device + '/'
+                    if not os.path.exists(path):
+                        logging.info('Directory "%s" does not exist, creating it...' % path)
+                        os.makedirs(path)
+                try:
+                    f5Backup(device, config['credentials']['username'], config['credentials']['password'], path)
+                    logging.info('<<<< backup of %s successfully finish.' % device)
+                except Exception as e:
+                    logging.error('<<<< backup of %s failed.' % device, exc_info=True)
+                    continue
+            logging.info('#### Finish backup operation for %s ####' % config['devices'])
+            exit()
+        else:
+            logging.error('--hostname argument is required.')
+            exit(1)
+    else:
+        #logging init
+        logging.basicConfig(level=logging.DEBUG, format='%(asctime)s-%(process)d-%(levelname)s-%(message)s')
+        # Request user credential
+        username, password = credential()
+        try:
+            f5Backup(opts.hostname, username, password, './')
+        except:
+           logging.error('<<<< backup of %s failed.' % opts.hostname, exc_info=True) 
+           exit(1)
