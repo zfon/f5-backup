@@ -308,7 +308,7 @@ if __name__ == "__main__":
                 logging.error('>> Backup path "%s" does not exist.' % config['backups']['path'])
                 exit(1)
             if not os.path.exists(config['logging']['path']):
-                logging.error('>> Logging path "%s" does not exist.' % config['backups']['path'])
+                logging.error('>> Logging path "%s" does not exist.' % config['logging']['path'])
                 exit(1)      
                       
             if config['logging']['print']:
